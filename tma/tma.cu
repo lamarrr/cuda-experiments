@@ -31,7 +31,7 @@ template <typename T> defer(T) -> defer<T>;
                  cuda::std::fma(b, c, a))
 
 // ----------------------
-// KernelFn 1: normal grid-strided FMA
+// Kernel 1: normal grid-strided FMA
 // ----------------------
 template <i32 ARITHMETIC_INTENSITY>
 __global__ void fma_no_tma(DType const *__restrict__ src1,
@@ -74,7 +74,7 @@ constexpr i32 BULK_COPY_ALIGNMENT = 128;
 constexpr i32 BULK_COPY_SIZE_MULTIPLE = 16;
 
 // ----------------------
-// KernelFn 2: real TMA (SM90+) FMA
+// Kernel 2: real TMA (SM90+) FMA
 // ----------------------
 
 __device__ inline void tile_load2(u64 *__restrict__ bar,
