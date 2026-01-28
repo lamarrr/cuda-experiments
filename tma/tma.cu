@@ -4,6 +4,7 @@
 #include <cuda/ptx>
 #include <cuda/std/cmath>
 #include <cuda_runtime.h>
+#include <nvbench/nvbench.cuh>
 
 template <typename T> struct defer {
   T op_;
@@ -82,14 +83,12 @@ __device__ inline void tile_load2(u64 *__restrict__ bar,
                                   void const *__restrict__ src2,
                                   void *__restrict__ dst1,
                                   void *__restrict__ dst2, u32 tile_bytes) {
-  cuda::ptx::fence_proxy_async(cuda::ptx::space_shared);
-
   u32 copied = 0;
 
-  cuda::ptx::cp_async_bulk(cuda::ptx::space_cluster, cuda::ptx::space_global,
+  cuda::ptx::cp_async_bulk(cuda::ptx::space_shared, cuda::ptx::space_global,
                            dst1, src1, tile_bytes, bar);
   copied += tile_bytes;
-  cuda::ptx::cp_async_bulk(cuda::ptx::space_cluster, cuda::ptx::space_global,
+  cuda::ptx::cp_async_bulk(cuda::ptx::space_shared, cuda::ptx::space_global,
                            dst2, src2, tile_bytes, bar);
   copied += tile_bytes;
 
@@ -120,6 +119,19 @@ __device__ inline void wait_tma_parity(u64 *__restrict__ bar, u32 parity) {
   } while (!cuda::ptx::mbarrier_try_wait_parity(bar, parity));
 }
 
+__device__ inline static bool elect_one() {
+  u32 const membermask = ~0;
+  u32 is_elected;
+  asm volatile("{\n\t .reg .pred P_OUT; \n\t"
+               "elect.sync _|P_OUT, %1;\n\t"
+               "selp.b32 %0, 1, 0, P_OUT; \n"
+               "}"
+               : "=r"(is_elected)
+               : "r"(membermask)
+               :);
+  return threadIdx.x < 32 && static_cast<bool>(is_elected);
+}
+
 template <i32 TILE_DIM, i32 ARITHMETIC_INTENSITY>
 __global__ void fma_tma_grid_strided(DType const *__restrict__ src1,
                                      DType const *__restrict__ src2,
@@ -147,7 +159,7 @@ __global__ void fma_tma_grid_strided(DType const *__restrict__ src1,
     u32 const tile_bytes = num_tile_elements * sizeof(DType);
 
     // Issue TMA copy into shared memory
-    if (threadIdx.x == 0) {
+    if (elect_one()) {
       tile_load2(&bar, src1 + tile_begin, src2 + tile_begin, tile1, tile2,
                  TILE_DIM * sizeof(DType));
     }
@@ -186,7 +198,7 @@ __global__ void fma_tma_shmem(DType const *__restrict__ src1,
   i32 const num_tile_elements = (i32)(tile_end - tile_begin);
 
   // Issue TMA copy into shared memory
-  if (threadIdx.x == 0) {
+  if (elect_one()) {
     tile_load2(&bar, src1 + tile_begin, src2 + tile_begin, tile1, tile2,
                TILE_DIM * sizeof(DType));
   }
@@ -226,7 +238,7 @@ __global__ void fma_tma_tuned_dyn_shmem(DType const *__restrict__ src1,
   i32 const num_tile_elements = (i32)(tile_end - tile_begin);
 
   // Issue TMA copy into shared memory
-  if (threadIdx.x == 0) {
+  if (elect_one()) {
     tile_load2(bar, src1 + tile_begin, src2 + tile_begin, tile1, tile2,
                tile_dim * sizeof(DType));
   }
@@ -300,7 +312,7 @@ i32 max_sm_occupancy(KernelFn kernel, i32 block_size, i32 dynamic_smem_bytes) {
 
 // Returns the minimum bytes in flight for a given architecture
 // needed to saturate the TMA pipes
-constexpr i32 arch_to_min_bytes_in_flight(i32 sm_arch) {
+constexpr i32 min_saturating_bytes_in_flight(i32 sm_arch) {
   if (sm_arch >= 900) {
     // 32 for H100, 48 for H200
     return 48 * 1024;
@@ -332,7 +344,7 @@ template <typename KernelFn>
 saturation_stats tune_tma_kernel(KernelFn kernel_fn) {
 
   // assuming sm_90+
-  constexpr auto sat_bytes_in_flight = arch_to_min_bytes_in_flight(900);
+  constexpr auto sat_bytes_in_flight = min_saturating_bytes_in_flight(900);
   auto const max_smem = block_smem_capacity();
 
   ///////////// kernel-derived parameters
@@ -372,22 +384,11 @@ saturation_stats tune_tma_kernel(KernelFn kernel_fn) {
   return last_counts;
 }
 
-// ----------------------
-// Host benchmark
-// ----------------------
-i32 main() {
-  i64 const N = 1'000'000'000L;
-  constexpr i32 ARITHMETIC_INTENSITY = 512;
-  constexpr i32 TILE_DIM = 4096;
-
-  DType *dA;
+void generate_input(DType *&dA, DType *&dB, i64 N) {
   cudaMalloc(&dA, N * sizeof(DType));
   CHECK_CUDA_ERR();
-  defer dA_{[&] { cudaFree(dA); }};
-  DType *dB;
   cudaMalloc(&dB, N * sizeof(DType));
   CHECK_CUDA_ERR();
-  defer dB_{[&] { cudaFree(dB); }};
 
   DType *hA = new DType[N];
   defer hA_{[&] { delete[] hA; }};
@@ -402,139 +403,162 @@ i32 main() {
   CHECK_CUDA_ERR();
   cudaMemcpy(dB, hB, N * sizeof(DType), cudaMemcpyHostToDevice);
   CHECK_CUDA_ERR();
-
-  DType *dC;
-  cudaMalloc(&dC, N * sizeof(DType));
-  CHECK_CUDA_ERR();
-  defer dC_{[&] { cudaFree(dC); }};
-  cudaMemset(dC, 0, N * sizeof(DType));
-  CHECK_CUDA_ERR();
-  DType *hC = new DType[N];
-  defer hC_{[&] { delete[] hC; }};
-
-  {
-
-    // --- Benchmark normal FMA ---
-    auto no_tma = [&] {
-      i32 grid_size;
-      i32 block_size;
-
-      cudaOccupancyMaxPotentialBlockSizeWithFlags(
-          &grid_size, &block_size, &fma_no_tma<ARITHMETIC_INTENSITY>, 0, 0, 0);
-      CHECK_CUDA_ERR();
-      fma_no_tma<ARITHMETIC_INTENSITY>
-          <<<grid_size, block_size>>>(dA, dB, dC, N);
-      cudaDeviceSynchronize();
-      CHECK_CUDA_ERR();
-    };
-
-    TIMEIT("no_tma", no_tma());
-    cudaMemcpy(hC, dC, N * sizeof(DType), cudaMemcpyDeviceToHost);
-    CHECK_CUDA_ERR();
-  }
-
-  auto log_diff = [&](const char *label, DType *dCx) {
-    DType *hCx = new DType[N];
-    defer hCx_{[&] { delete[] hCx; }};
-    cudaMemcpy(hCx, dCx, N * sizeof(DType), cudaMemcpyDeviceToHost);
-    CHECK_CUDA_ERR();
-
-    DType diff = 0.0f;
-
-    for (i64 i = 0; i < N; ++i) {
-      diff += std::abs(hCx[i] - hC[i]);
-    }
-
-    LOG("Total difference (%s vs non-TMA): %e\n", label, diff);
-  };
-
-  {
-    DType *dCx;
-    cudaMalloc(&dCx, N * sizeof(DType));
-    CHECK_CUDA_ERR();
-    defer dCx_{[&] { cudaFree(dCx); }};
-    cudaMemset(dCx, 0, N * sizeof(DType));
-    CHECK_CUDA_ERR();
-
-    // --- Benchmark TMA FMA ---
-    auto tma = [&] {
-      i32 grid_size;
-      i32 block_size;
-
-      cudaOccupancyMaxPotentialBlockSizeWithFlags(
-          &grid_size, &block_size,
-          &fma_no_tma_no_restrict<ARITHMETIC_INTENSITY>, 0, 0, 0);
-      CHECK_CUDA_ERR();
-      fma_no_tma_no_restrict<ARITHMETIC_INTENSITY>
-          <<<grid_size, block_size>>>(dA, dB, dCx, N);
-      cudaDeviceSynchronize();
-      CHECK_CUDA_ERR();
-    };
-
-    TIMEIT("no_tma_no_restrict", tma());
-    log_diff("no_tma_no_restrict", dCx);
-  }
-
-  {
-    DType *dCx;
-    cudaMalloc(&dCx, N * sizeof(DType));
-    CHECK_CUDA_ERR();
-    defer dCx_{[&] { cudaFree(dCx); }};
-    cudaMemset(dCx, 0, N * sizeof(DType));
-    CHECK_CUDA_ERR();
-
-    // --- Benchmark TMA FMA ---
-    auto tma = [&] {
-      i32 grid_size;
-      i32 block_size;
-
-      cudaOccupancyMaxPotentialBlockSizeWithFlags(
-          &grid_size, &block_size,
-          &fma_tma_grid_strided<TILE_DIM, ARITHMETIC_INTENSITY>, 0, 0, 0);
-      CHECK_CUDA_ERR();
-      fma_tma_grid_strided<TILE_DIM, ARITHMETIC_INTENSITY>
-          <<<grid_size, block_size>>>(dA, dB, dCx, N);
-      cudaDeviceSynchronize();
-      CHECK_CUDA_ERR();
-    };
-
-    TIMEIT("tma", tma());
-    log_diff("TMA", dCx);
-  }
-
-  // --- Benchmark TMA FMA with dynamic tuned shmem ---
-  {
-    DType *dCx;
-    cudaMalloc(&dCx, N * sizeof(DType));
-    CHECK_CUDA_ERR();
-    defer dCx_{[&] { cudaFree(dCx); }};
-    cudaMemset(dCx, 0, N * sizeof(DType));
-    CHECK_CUDA_ERR();
-
-    auto tma_sched_dynamic_shmem = [&] {
-      auto stats =
-          tune_tma_kernel(&fma_tma_tuned_dyn_shmem<ARITHMETIC_INTENSITY>);
-
-      auto block_dim = tma_policy::block_dim;
-      auto grid_dim = (N + stats.tile_dim - 1) / stats.tile_dim;
-      auto bar_offset = 0;
-      auto tile1_offset =
-          alignup(bar_offset + sizeof(u64), BULK_COPY_ALIGNMENT);
-      auto tile2_offset = alignup(tile1_offset + stats.tile_dim * sizeof(DType),
-                                  BULK_COPY_ALIGNMENT);
-
-      // TODO: re-check all
-      fma_tma_tuned_dyn_shmem<ARITHMETIC_INTENSITY>
-          <<<grid_dim, block_dim, stats.smem_req>>>(dA, dB, bar_offset,
-                                                    tile1_offset, tile2_offset,
-                                                    stats.tile_dim, dCx, N);
-      cudaDeviceSynchronize();
-      CHECK_CUDA_ERR();
-    };
-
-    TIMEIT("tma_sched_dynamic_shmem", tma_sched_dynamic_shmem());
-    log_diff("TMA sched dynamic smem", dCx);
-  }
-
-  return 0;
 }
+
+void log_diff(const char *label, DType *a, DType *b, i64 N) {
+  DType *ha = new DType[N];
+  defer ha_{[&] { delete[] ha; }};
+  cudaMemcpy(ha, a, N * sizeof(DType), cudaMemcpyDeviceToHost);
+  CHECK_CUDA_ERR();
+  DType *hb = new DType[N];
+  defer hb_{[&] { delete[] hb; }};
+  cudaMemcpy(hb, b, N * sizeof(DType), cudaMemcpyDeviceToHost);
+  CHECK_CUDA_ERR();
+
+  DType diff = 0.0f;
+
+  for (i64 i = 0; i < N; ++i) {
+    diff += std::abs(ha[i] - hb[i]);
+  }
+
+  LOG("Total difference (%s): %e\n", label, diff);
+}
+
+#define BENCHMARK_PRELUDE                                                      \
+  static constexpr i32 ARITHMETIC_INTENSITY = 32;                              \
+  i64 const N = state.get_int64("N");                                          \
+  constexpr i32 TILE_DIM = 4096;                                               \
+                                                                               \
+  DType *dA;                                                                   \
+  DType *dB;                                                                   \
+  generate_input(dA, dB, N);                                                   \
+  defer dA_{[&] { cudaFree(dA); }};                                            \
+  defer dB_{[&] { cudaFree(dB); }};                                            \
+                                                                               \
+  state.add_global_memory_reads<DType>(static_cast<size_t>(N) * 2);            \
+  state.add_global_memory_writes<DType>(static_cast<size_t>(N));               \
+  state.add_element_count("FMA/row", ARITHMETIC_INTENSITY * 4);                \
+  state.add_element_count("row_count", N);
+
+// --- Benchmark normal FMA ---
+void bench_fma_no_tma(nvbench::state &state) {
+  BENCHMARK_PRELUDE
+
+  state.exec(nvbench::exec_tag::sync, [&](nvbench::launch &) {
+    DType *dCx;
+    cudaMalloc(&dCx, N * sizeof(DType));
+    CHECK_CUDA_ERR();
+    defer dCx_{[&] { cudaFree(dCx); }};
+    cudaMemset(dCx, 0, N * sizeof(DType));
+    CHECK_CUDA_ERR();
+
+    i32 grid_size;
+    i32 block_size;
+
+    cudaOccupancyMaxPotentialBlockSizeWithFlags(
+        &grid_size, &block_size, &fma_no_tma<ARITHMETIC_INTENSITY>, 0, 0, 0);
+    CHECK_CUDA_ERR();
+    fma_no_tma<ARITHMETIC_INTENSITY><<<grid_size, block_size>>>(dA, dB, dCx, N);
+    CHECK_CUDA_ERR();
+  });
+}
+
+// --- Benchmark normal FMA ---
+void bench_fma_no_tma_no_restrict(nvbench::state &state) {
+  BENCHMARK_PRELUDE
+
+  state.exec(nvbench::exec_tag::sync, [&](nvbench::launch &) {
+    DType *dCx;
+    cudaMalloc(&dCx, N * sizeof(DType));
+    CHECK_CUDA_ERR();
+    defer dCx_{[&] { cudaFree(dCx); }};
+    cudaMemset(dCx, 0, N * sizeof(DType));
+    CHECK_CUDA_ERR();
+
+    i32 grid_size;
+    i32 block_size;
+
+    cudaOccupancyMaxPotentialBlockSizeWithFlags(
+        &grid_size, &block_size, &fma_no_tma_no_restrict<ARITHMETIC_INTENSITY>,
+        0, 0, 0);
+    CHECK_CUDA_ERR();
+    fma_no_tma_no_restrict<ARITHMETIC_INTENSITY>
+        <<<grid_size, block_size>>>(dA, dB, dCx, N);
+    CHECK_CUDA_ERR();
+  });
+}
+
+// --- Benchmark FMA with static TILE_DIM and grid-strided ---
+void bench_fma_tma_grid_strided(nvbench::state &state) {
+  BENCHMARK_PRELUDE
+
+  i32 grid_size;
+  i32 block_size;
+
+  cudaOccupancyMaxPotentialBlockSizeWithFlags(
+      &grid_size, &block_size,
+      &fma_tma_grid_strided<TILE_DIM, ARITHMETIC_INTENSITY>, 0, 0, 0);
+
+  state.exec(nvbench::exec_tag::sync, [&](nvbench::launch &) {
+    DType *dCx;
+    cudaMalloc(&dCx, N * sizeof(DType));
+    CHECK_CUDA_ERR();
+    defer dCx_{[&] { cudaFree(dCx); }};
+    cudaMemset(dCx, 0, N * sizeof(DType));
+    CHECK_CUDA_ERR();
+
+    CHECK_CUDA_ERR();
+    fma_tma_grid_strided<TILE_DIM, ARITHMETIC_INTENSITY>
+        <<<grid_size, block_size>>>(dA, dB, dCx, N);
+    CHECK_CUDA_ERR();
+  });
+}
+
+// --- Benchmark FMA with dynamic tuned shmem TMA ---
+void bench_fma_tma_tuned(nvbench::state &state) {
+  BENCHMARK_PRELUDE
+
+  auto stats = tune_tma_kernel(&fma_tma_tuned_dyn_shmem<ARITHMETIC_INTENSITY>);
+
+  state.exec(nvbench::exec_tag::sync, [&](nvbench::launch &) {
+    DType *dCx;
+    cudaMalloc(&dCx, N * sizeof(DType));
+    CHECK_CUDA_ERR();
+    defer dCx_{[&] { cudaFree(dCx); }};
+    cudaMemset(dCx, 0, N * sizeof(DType));
+    CHECK_CUDA_ERR();
+
+    auto block_dim = tma_policy::block_dim;
+    auto grid_dim = (N + stats.tile_dim - 1) / stats.tile_dim;
+    auto bar_offset = 0;
+    auto tile1_offset = alignup(bar_offset + sizeof(u64), BULK_COPY_ALIGNMENT);
+    auto tile2_offset = alignup(tile1_offset + stats.tile_dim * sizeof(DType),
+                                BULK_COPY_ALIGNMENT);
+
+    // TODO: re-check all
+    fma_tma_tuned_dyn_shmem<ARITHMETIC_INTENSITY>
+        <<<grid_dim, block_dim, stats.smem_req>>>(dA, dB, bar_offset,
+                                                  tile1_offset, tile2_offset,
+                                                  stats.tile_dim, dCx, N);
+    cudaDeviceSynchronize();
+    CHECK_CUDA_ERR();
+  });
+}
+
+NVBENCH_BENCH(bench_fma_no_tma)
+    .set_name("bench_fma_no_tma")
+    .add_int64_power_of_two_axis("N", {30, 31, 32});
+
+NVBENCH_BENCH(bench_fma_no_tma_no_restrict)
+    .set_name("bench_fma_no_tma_no_restrict")
+    .add_int64_power_of_two_axis("N", {30, 31, 32});
+
+NVBENCH_BENCH(bench_fma_tma_grid_strided)
+    .set_name("bench_fma_tma_grid_strided")
+    .add_int64_power_of_two_axis("N", {30, 31, 32});
+
+NVBENCH_BENCH(bench_fma_tma_tuned)
+    .set_name("bench_fma_tma_tuned")
+    .add_int64_power_of_two_axis("N", {30, 31, 32});
+
+NVBENCH_MAIN
