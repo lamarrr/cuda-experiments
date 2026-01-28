@@ -437,8 +437,8 @@ void log_diff(const char *label, DType *a, DType *b, i64 N) {
                                                                                \
   state.add_global_memory_reads<DType>(static_cast<size_t>(N) * 2);            \
   state.add_global_memory_writes<DType>(static_cast<size_t>(N));               \
-  state.add_element_count("FMA/row", ARITHMETIC_INTENSITY * 4);                \
-  state.add_element_count("row_count", N);
+  state.add_element_count(ARITHMETIC_INTENSITY * 4, "FMA/row");                \
+  state.add_element_count(N, "row_count");
 
 // --- Benchmark normal FMA ---
 void bench_fma_no_tma(nvbench::state &state) {
