@@ -34,7 +34,7 @@ template <typename T> defer(T) -> defer<T>;
 // ----------------------
 // Kernel 1: normal grid-strided FMA
 // ----------------------
-template <i32 ARITHMETIC_INTENSITY>
+template <typename DType, i32 ARITHMETIC_INTENSITY>
 __global__ void fma_no_tma(DType const *__restrict__ src1,
                            DType const *__restrict__ src2,
                            DType *__restrict__ dst1, i64 n) {
@@ -53,7 +53,61 @@ __global__ void fma_no_tma(DType const *__restrict__ src1,
   }
 }
 
-template <i32 ARITHMETIC_INTENSITY>
+template <typename DType, i32 ARITHMETIC_INTENSITY>
+__global__ void fma_no_tma_per_block(DType const *__restrict__ src1,
+                                     DType const *__restrict__ src2,
+                                     DType *__restrict__ dst1, i64 n) {
+  i64 idx = (i64)blockIdx.x * (i64)blockDim.x + (i64)threadIdx.x;
+  if (idx >= n)
+    return;
+  DType a = src1[idx];
+  DType b = src2[idx];
+  DType c = a + b;
+#pragma unroll
+  for (i32 k = 0; k < ARITHMETIC_INTENSITY; ++k) {
+    c = GENERIC_OP(a, b, c);
+  }
+  dst1[idx] = c;
+}
+
+template <typename DType, i32 ARITHMETIC_INTENSITY, i32 ITEMS_PER_THREAD>
+__global__ void fma_no_tma_ilp(DType const *__restrict__ src1,
+                               DType const *__restrict__ src2,
+                               DType *__restrict__ dst1, i64 n) {
+  i64 idx = (i64)blockIdx.x * (i64)blockDim.x + (i64)threadIdx.x;
+  i64 stride = (i64)blockDim.x * (i64)gridDim.x;
+
+  DType src1_buf[ITEMS_PER_THREAD];
+  DType src2_buf[ITEMS_PER_THREAD];
+
+  for (i64 i = idx * ITEMS_PER_THREAD; i < n; i += stride * ITEMS_PER_THREAD) {
+#pragma unroll
+    for (i32 item = 0; item < ITEMS_PER_THREAD; ++item) {
+      i64 index = i + item;
+      if (index < n) {
+        src1_buf[item] = src1[index];
+        src2_buf[item] = src2[index];
+      }
+    }
+
+#pragma unroll
+    for (i32 item = 0; item < ITEMS_PER_THREAD; ++item) {
+      i64 index = i + item;
+      if (index < n) {
+        DType a = src1_buf[item];
+        DType b = src2_buf[item];
+        DType c = a + b;
+#pragma unroll
+        for (i32 k = 0; k < ARITHMETIC_INTENSITY; ++k) {
+          c = GENERIC_OP(a, b, c);
+        }
+        dst1[index] = c;
+      }
+    }
+  }
+}
+
+template <typename DType, i32 ARITHMETIC_INTENSITY>
 __global__ void fma_no_tma_no_restrict(DType const *src1, DType const *src2,
                                        DType *dst1, i64 n) {
   i64 idx = (i64)blockIdx.x * (i64)blockDim.x + (i64)threadIdx.x;
@@ -97,7 +151,7 @@ __device__ inline void tile_load2(u64 *__restrict__ bar,
                                        cuda::ptx::space_shared, bar, copied);
 }
 
-template <i32 ARITHMETIC_INTENSITY>
+template <typename DType, i32 ARITHMETIC_INTENSITY>
 __device__ inline void process_tile2(DType const *__restrict__ tile1,
                                      DType const *__restrict__ tile2,
                                      i32 tile_offset, i32 num_tile_elements,
@@ -119,7 +173,17 @@ __device__ inline void wait_tma_parity(u64 *__restrict__ bar, u32 parity) {
   } while (!cuda::ptx::mbarrier_try_wait_parity(bar, parity));
 }
 
-__device__ inline static bool elect_one() {
+__device__ inline bool elect_one_CUDA() {
+  const unsigned int tid = threadIdx.x;
+  const unsigned int warp_id = tid / 32;
+  const unsigned int uniform_warp_id =
+      __shfl_sync(0xFFFFFFFF, warp_id, 0); // broadcast from lane 0
+  return (
+      uniform_warp_id == 0 &&
+      cuda::ptx::elect_sync(0xFFFFFFFF)); // elect a leader thread among warp 0
+}
+
+__device__ inline bool elect_one_PTX() {
   u32 const membermask = ~0;
   u32 is_elected;
   asm volatile("{\n\t .reg .pred P_OUT; \n\t"
@@ -132,7 +196,9 @@ __device__ inline static bool elect_one() {
   return threadIdx.x < 32 && static_cast<bool>(is_elected);
 }
 
-template <i32 TILE_DIM, i32 ARITHMETIC_INTENSITY>
+__device__ inline bool elect_one() { return elect_one_PTX(); }
+
+template <typename DType, i32 TILE_DIM, i32 ARITHMETIC_INTENSITY>
 __global__ void fma_tma_grid_strided(DType const *__restrict__ src1,
                                      DType const *__restrict__ src2,
                                      DType *__restrict__ dst1, i64 n) {
@@ -169,14 +235,13 @@ __global__ void fma_tma_grid_strided(DType const *__restrict__ src1,
     wait_tma_parity(&bar, wait_parity);
 
     i64 const tile_stride = blockDim.x;
-    process_tile2<ARITHMETIC_INTENSITY>(tile1, tile2, threadIdx.x,
-                                        num_tile_elements, dst1 + tile_begin,
-                                        blockDim.x);
+    process_tile2<DType, ARITHMETIC_INTENSITY>(tile1, tile2, threadIdx.x,
+                                               num_tile_elements,
+                                               dst1 + tile_begin, blockDim.x);
   }
 }
 
-// TODO: implement
-template <i32 TILE_DIM, i32 ARITHMETIC_INTENSITY>
+template <typename DType, i32 TILE_DIM, i32 ARITHMETIC_INTENSITY>
 __global__ void fma_tma_shmem(DType const *__restrict__ src1,
                               DType const *__restrict__ src2,
                               DType *__restrict__ dst1, i64 n) {
@@ -208,12 +273,12 @@ __global__ void fma_tma_shmem(DType const *__restrict__ src1,
   u32 const wait_parity = 0;
   wait_tma_parity(&bar, wait_parity);
 
-  process_tile2<ARITHMETIC_INTENSITY>(tile1, tile2, threadIdx.x,
-                                      num_tile_elements, dst1 + tile_begin,
-                                      blockDim.x);
+  process_tile2<DType, ARITHMETIC_INTENSITY>(tile1, tile2, threadIdx.x,
+                                             num_tile_elements,
+                                             dst1 + tile_begin, blockDim.x);
 }
 
-template <i32 ARITHMETIC_INTENSITY>
+template <typename DType, i32 ARITHMETIC_INTENSITY>
 __global__ void fma_tma_tuned_dyn_shmem(DType const *__restrict__ src1,
                                         DType const *__restrict__ src2,
                                         i32 bar_offset, i32 tile1_offset,
@@ -248,9 +313,9 @@ __global__ void fma_tma_tuned_dyn_shmem(DType const *__restrict__ src1,
   u32 const wait_parity = 0;
   wait_tma_parity(bar, wait_parity);
 
-  process_tile2<ARITHMETIC_INTENSITY>(tile1, tile2, threadIdx.x,
-                                      num_tile_elements, dst1 + tile_begin,
-                                      blockDim.x);
+  process_tile2<DType, ARITHMETIC_INTENSITY>(tile1, tile2, threadIdx.x,
+                                             num_tile_elements,
+                                             dst1 + tile_begin, blockDim.x);
 }
 
 #define LOG(...)                                                               \
@@ -456,9 +521,84 @@ void bench_fma_no_tma(nvbench::state &state) {
     i32 block_size;
 
     cudaOccupancyMaxPotentialBlockSizeWithFlags(
-        &grid_size, &block_size, &fma_no_tma<ARITHMETIC_INTENSITY>, 0, 0, 0);
+        &grid_size, &block_size, &fma_no_tma<DType, ARITHMETIC_INTENSITY>, 0, 0,
+        0);
     CHECK_CUDA_ERR();
-    fma_no_tma<ARITHMETIC_INTENSITY><<<grid_size, block_size>>>(dA, dB, dCx, N);
+    fma_no_tma<DType, ARITHMETIC_INTENSITY>
+        <<<grid_size, block_size>>>(dA, dB, dCx, N);
+    CHECK_CUDA_ERR();
+  });
+}
+
+void bench_fma_no_tma_per_block(nvbench::state &state) {
+  BENCHMARK_PRELUDE
+
+  state.exec(nvbench::exec_tag::sync, [&](nvbench::launch &) {
+    DType *dCx;
+    cudaMalloc(&dCx, N * sizeof(DType));
+    CHECK_CUDA_ERR();
+    defer dCx_{[&] { cudaFree(dCx); }};
+    cudaMemset(dCx, 0, N * sizeof(DType));
+    CHECK_CUDA_ERR();
+
+    i32 grid_size;
+    i32 block_size;
+
+    cudaOccupancyMaxPotentialBlockSizeWithFlags(
+        &grid_size, &block_size,
+        &fma_no_tma_per_block<DType, ARITHMETIC_INTENSITY>, 0, 0, 0);
+    CHECK_CUDA_ERR();
+    grid_size = min(grid_size, (i32)((N + block_size - 1) / block_size));
+    fma_no_tma_per_block<DType, ARITHMETIC_INTENSITY>
+        <<<grid_size, block_size>>>(dA, dB, dCx, N);
+    CHECK_CUDA_ERR();
+  });
+}
+
+void bench_fma_no_tma_ilp4(nvbench::state &state) {
+  BENCHMARK_PRELUDE
+
+  state.exec(nvbench::exec_tag::sync, [&](nvbench::launch &) {
+    DType *dCx;
+    cudaMalloc(&dCx, N * sizeof(DType));
+    CHECK_CUDA_ERR();
+    defer dCx_{[&] { cudaFree(dCx); }};
+    cudaMemset(dCx, 0, N * sizeof(DType));
+    CHECK_CUDA_ERR();
+
+    i32 grid_size;
+    i32 block_size;
+
+    cudaOccupancyMaxPotentialBlockSizeWithFlags(
+        &grid_size, &block_size,
+        &fma_no_tma_ilp<DType, ARITHMETIC_INTENSITY, 4>, 0, 0, 0);
+    CHECK_CUDA_ERR();
+    fma_no_tma_ilp<DType, ARITHMETIC_INTENSITY, 4>
+        <<<grid_size, block_size>>>(dA, dB, dCx, N);
+    CHECK_CUDA_ERR();
+  });
+}
+
+void bench_fma_no_tma_ilp8(nvbench::state &state) {
+  BENCHMARK_PRELUDE
+
+  state.exec(nvbench::exec_tag::sync, [&](nvbench::launch &) {
+    DType *dCx;
+    cudaMalloc(&dCx, N * sizeof(DType));
+    CHECK_CUDA_ERR();
+    defer dCx_{[&] { cudaFree(dCx); }};
+    cudaMemset(dCx, 0, N * sizeof(DType));
+    CHECK_CUDA_ERR();
+
+    i32 grid_size;
+    i32 block_size;
+
+    cudaOccupancyMaxPotentialBlockSizeWithFlags(
+        &grid_size, &block_size,
+        &fma_no_tma_ilp<DType, ARITHMETIC_INTENSITY, 8>, 0, 0, 0);
+    CHECK_CUDA_ERR();
+    fma_no_tma_ilp<DType, ARITHMETIC_INTENSITY, 8>
+        <<<grid_size, block_size>>>(dA, dB, dCx, N);
     CHECK_CUDA_ERR();
   });
 }
@@ -479,10 +619,10 @@ void bench_fma_no_tma_no_restrict(nvbench::state &state) {
     i32 block_size;
 
     cudaOccupancyMaxPotentialBlockSizeWithFlags(
-        &grid_size, &block_size, &fma_no_tma_no_restrict<ARITHMETIC_INTENSITY>,
-        0, 0, 0);
+        &grid_size, &block_size,
+        &fma_no_tma_no_restrict<DType, ARITHMETIC_INTENSITY>, 0, 0, 0);
     CHECK_CUDA_ERR();
-    fma_no_tma_no_restrict<ARITHMETIC_INTENSITY>
+    fma_no_tma_no_restrict<DType, ARITHMETIC_INTENSITY>
         <<<grid_size, block_size>>>(dA, dB, dCx, N);
     CHECK_CUDA_ERR();
   });
@@ -497,7 +637,7 @@ void bench_fma_tma_grid_strided(nvbench::state &state) {
 
   cudaOccupancyMaxPotentialBlockSizeWithFlags(
       &grid_size, &block_size,
-      &fma_tma_grid_strided<TILE_DIM, ARITHMETIC_INTENSITY>, 0, 0, 0);
+      &fma_tma_grid_strided<DType, TILE_DIM, ARITHMETIC_INTENSITY>, 0, 0, 0);
 
   state.exec(nvbench::exec_tag::sync, [&](nvbench::launch &) {
     DType *dCx;
@@ -508,7 +648,7 @@ void bench_fma_tma_grid_strided(nvbench::state &state) {
     CHECK_CUDA_ERR();
 
     CHECK_CUDA_ERR();
-    fma_tma_grid_strided<TILE_DIM, ARITHMETIC_INTENSITY>
+    fma_tma_grid_strided<DType, TILE_DIM, ARITHMETIC_INTENSITY>
         <<<grid_size, block_size>>>(dA, dB, dCx, N);
     CHECK_CUDA_ERR();
   });
@@ -518,7 +658,8 @@ void bench_fma_tma_grid_strided(nvbench::state &state) {
 void bench_fma_tma_tuned(nvbench::state &state) {
   BENCHMARK_PRELUDE
 
-  auto stats = tune_tma_kernel(&fma_tma_tuned_dyn_shmem<ARITHMETIC_INTENSITY>);
+  auto stats =
+      tune_tma_kernel(&fma_tma_tuned_dyn_shmem<DType, ARITHMETIC_INTENSITY>);
 
   state.exec(nvbench::exec_tag::sync, [&](nvbench::launch &) {
     DType *dCx;
@@ -536,7 +677,7 @@ void bench_fma_tma_tuned(nvbench::state &state) {
                                 BULK_COPY_ALIGNMENT);
 
     // TODO: re-check all
-    fma_tma_tuned_dyn_shmem<ARITHMETIC_INTENSITY>
+    fma_tma_tuned_dyn_shmem<DType, ARITHMETIC_INTENSITY>
         <<<grid_dim, block_dim, stats.smem_req>>>(dA, dB, bar_offset,
                                                   tile1_offset, tile2_offset,
                                                   stats.tile_dim, dCx, N);
@@ -547,6 +688,14 @@ void bench_fma_tma_tuned(nvbench::state &state) {
 
 NVBENCH_BENCH(bench_fma_no_tma)
     .set_name("bench_fma_no_tma")
+    .add_int64_power_of_two_axis("N", {30, 31, 32});
+
+NVBENCH_BENCH(bench_fma_no_tma_ilp4)
+    .set_name("bench_fma_no_tma_ilp4")
+    .add_int64_power_of_two_axis("N", {30, 31, 32});
+
+NVBENCH_BENCH(bench_fma_no_tma_ilp8)
+    .set_name("bench_fma_no_tma_ilp8")
     .add_int64_power_of_two_axis("N", {30, 31, 32});
 
 NVBENCH_BENCH(bench_fma_no_tma_no_restrict)
